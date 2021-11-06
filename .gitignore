@@ -1,0 +1,11 @@
+## ignore cached temp data, but keep the directory
+tempData/*
+scrapedData/*
+compiledData/*
+## ignore meta data file
+cachedMetaData.json
+## ignore cgmix consts
+cgmixConsts.json
+
+## ignore graphing of runtimes
+*.xlsx
