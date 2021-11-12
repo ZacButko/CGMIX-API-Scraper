@@ -1,3 +1,11 @@
+### Core file to pull data from the CGMIX server asynchronously
+# Data from the server is available via SOAP requests
+# __main__ function runs pullDatabase which will agressivly and in a fail safe manner
+# retrieve and compile data from all peripheral endpoints ['particulars', 'tonnage', 'dimensions']
+# into respective csv 'tables' which should match the database format found on the target server.
+# Async speedup is ~ 700 times faster than pulling endpoints one by one, and ~ 100 times faster than
+# than multithreading synchronous requests.
+
 import pandas as pd
 from tqdm import tqdm
 import time
@@ -19,20 +27,37 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 ## load up request parameters and ids to run through
-with open("cgmixConsts.json") as f:
+
+saveFiles = {
+    "summary": "compiledData/compiledSummaryData.csv",
+    "particulars": "compiledData/compiledParticularsData.csv",
+    "dimensions": "compiledData/compiledDimensionsData.csv",
+    "tonnage": "compiledData/compiledTonnageData.csv",
+    "meta": "cachedMetaData.json",
+    "consts": "cgmixConsts.json",
+}
+
+with open(saveFiles["consts"]) as f:
     consts = json.load(f)
 url = consts["url"]
 xmlMethods = consts["xmlMethods"]
 serviceTypeOptions = consts["serviceTypeOptions"]
-metaFile = "cachedMetaData.json"
+metaFile = saveFiles["meta"]
 
 
 def getKnownIds():
-    df = pd.read_csv("compiledData/compiledSummaryData.csv", index_col=False)
+    # in compiledSummaryData we already fetched 'summary' endpoint data
+    # Since the VesselId corresponds directly to the target database's
+    # internal priary key, we scraped for all ids from 1 to 2 milion
+    #
+    # this function returns all active VesselIds we know about as a list
+    df = pd.read_csv(saveFiles["summary"], index_col=False)
     return list(df["VesselId"])
 
 
 def xmlToDF(xmlData, vesselId):
+    # helper function to translate xml tree structured data into a pandas
+    # dataframe
     try:
         root = ET.fromstring(xmlData)
         for i in range(4):
@@ -57,6 +82,9 @@ def xmlToDF(xmlData, vesselId):
 
 
 async def aPostRequest(session, action, *bodyParams):
+    # Basic async request
+    # POSTS to 'url' with data of 'body'.
+    # header information is in 'aGetManyXMLData' function
     body = xmlMethods[action]["body"].format(*bodyParams)
     try:
         async with session.post(url, data=body) as r:
@@ -66,12 +94,18 @@ async def aPostRequest(session, action, *bodyParams):
     except Exception as e:
         logging.debug(e)
         return pd.DataFrame()
-        ## optional raise here
+        # TODO - respond appropriately to different types of connection errors
+        # TODO - raise exception here
     else:
         return xmlToDF(text, bodyParams[0])
 
 
 async def aGetManyXMLData(action, requestList):
+    # Sets up an async session under which to run many async requests
+    #   (this is much more efficient than opening a session for every request)
+    # stores resulting dataframes in a list, then concats the list into one resultant
+    # dataframe
+    # tqdm is the progress bar :)
     headers = {
         "content-type": "text/xml; charset=utf-8",
         "SOAPAction": xmlMethods[action]["action"],
@@ -88,13 +122,6 @@ async def aGetManyXMLData(action, requestList):
         ]
         # return reduce(lambda a, b: a.append(b), results)
         return pd.concat(results)
-
-
-saveFiles = {
-    "particulars": "compiledData/compiledParticularsData.csv",
-    "dimensions": "compiledData/compiledDimensionsData.csv",
-    "tonnage": "compiledData/compiledTonnageData.csv",
-}
 
 
 def runNewBatches(df, batches, action, failedIds=[]):
@@ -125,6 +152,11 @@ def runNewBatches(df, batches, action, failedIds=[]):
 
 
 def continueScrape(action, N=0, batchSize=100000):
+    # general idea is to pick up scraping where we left off
+    # 1. grab a list of ids to run based on all ids we know about,
+    #     minus ids that have failed and ids we already retreived
+    # 2. create appropriate batches to run based on N ids to scrape for in baches of batchSize
+    # 3. sends batches to runNewBatches()
     saveFile = saveFiles[action]
     knownIds = getKnownIds()
     if os.path.exists(saveFile):
@@ -160,6 +192,7 @@ def continueScrape(action, N=0, batchSize=100000):
 
 
 def getMissingIds(action):
+    # helper function to check how many ids are still missing (need to be scrapped for)
     dataFile = saveFiles[action]
     df = pd.read_csv(dataFile, index_col=False)
     fetchedIds = sorted(list(df["VesselId"]))
@@ -168,19 +201,9 @@ def getMissingIds(action):
     return missingIds
 
 
-def continueParticularsScrape(*args):
-    continueScrape("particulars", *args)
-
-
-def continueDimensionsScrape(*args):
-    continueScrape("dimensions", *args)
-
-
-def continueTonnageScrape(*args):
-    continueScrape("tonnage", *args)
-
-
 def getFailedIds(action):
+    # helper function to check how many ids have failed (returned nothing or had an error)
+    # for a given action (endpoint)
     with open(metaFile) as f:
         meta = json.load(f)
         if action in meta["failedIds"]:
@@ -190,12 +213,28 @@ def getFailedIds(action):
     return failedIds
 
 
-def clearFailedIds(action):
-    with open(metaFile) as f:
-        meta = json.load(f)
-    with open(metaFile, "w") as f:
-        meta["failedIds"][action] = []
-        json.dump(meta, f)
+# def clearFailedIds(action):
+#     # hacky way to rerun ids - just forget that they have failed
+#     with open(metaFile) as f:
+#         meta = json.load(f)
+#     with open(metaFile, "w") as f:
+#         meta["failedIds"][action] = []
+#         json.dump(meta, f)
+
+
+def continueParticularsScrape(*args):
+    # Continue scrape of vessels on 'particulars' endpoint
+    continueScrape("particulars", *args)
+
+
+def continueDimensionsScrape(*args):
+    # Continue scrape of vessels on 'dimensions' endpoint
+    continueScrape("dimensions", *args)
+
+
+def continueTonnageScrape(*args):
+    # Continue scrape of vessels on 'tonnage' endpoint
+    continueScrape("tonnage", *args)
 
 
 def rerunFailedBatches(df, batches, action, allFails):
@@ -225,6 +264,7 @@ def rerunFailedBatches(df, batches, action, allFails):
 
 
 def rerunFailedIds(action, N=0, batchSize=100000):
+    # bundles batches of failed ids to send to function 'rerunFailedBatches
     idsToRun = getFailedIds(action)
     if len(idsToRun) == 0:
         logging.info("Nothing to run")
@@ -258,6 +298,7 @@ def rerunFailedIds(action, N=0, batchSize=100000):
 
 
 def rerunAllFailed(batchSize=100000):
+    # checks all failed ids again
     for action in ["dimensions", "particulars", "tonnage"]:
         logging.info(f"Starting on {action}")
         rerunFailedIds(action, 0, batchSize)
@@ -265,6 +306,7 @@ def rerunAllFailed(batchSize=100000):
 
 
 def continueScrapeAll(batchSize=100000):
+    # scrapes all endpoints for all known vessel ids
     for action in ["dimensions", "particulars", "tonnage"]:
         logging.info(f"Starting on {action}")
         continueScrape(action, 0, batchSize)
@@ -272,6 +314,11 @@ def continueScrapeAll(batchSize=100000):
 
 
 def pullDatabase(batchSize=100000):
+    # Master function to load all perepheral endpoints based on a previously retreived 'summary' table.
+    # Built to be incredibly fail-safe. Kill the process anytime and it will start again from
+    #    its last known checkpoint (stored in 'metaFile')
+    # 1. scrape all data on a first pass
+    # 2. retry failed ids twice
     if os.path.exists(metaFile):
         with open(metaFile) as f:
             meta = json.load(f)
